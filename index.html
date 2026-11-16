@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FKX 云端高级营养配方系统</title>
+    <style>
+        /* 原生 CSS 样式，无需外网 */
+        :root {
+            --primary: #3b82f6;
+            --emerald: #10b981;
+            --orange: #f97316;
+            --bg: #f3f4f6;
+            --text: #1f2937;
+            --border: #e5e7eb;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { background-color: var(--bg); color: var(--text); padding: 10px; font-size: 14px; }
+        
+        /* 布局工具 */
+        .flex { display: flex; }
+        .flex-col { display: flex; flex-direction: column; }
+        .flex-wrap { flex-wrap: wrap; }
+        .justify-between { justify-content: space-between; }
+        .justify-center { justify-content: center; }
+        .items-center { align-items: center; }
+        .gap-2 { gap: 8px; }
+        .gap-4 { gap: 16px; }
+        .mt-2 { margin-top: 8px; }
+        .mt-4 { margin-top: 16px; }
+        .mb-2 { margin-bottom: 8px; }
+        .mb-4 { margin-bottom: 16px; }
+        .hidden { display: none !important; }
+
+        /* 卡片组件 */
+        .card { background: white; border-radius: 8px; padding: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 16px; border: 1px solid #f3f4f6; }
+        
+        /* 头部 */
+        .header { background: white; padding: 15px; border-radius: 8px; display: flex; align-items: center; gap: 12px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .header-icon { width: 40px; height: 40px; background: linear-gradient(135deg, var(--primary), var(--emerald)); border-radius: 8px; display: flex; align-items: center; justify-content: center; color: white; }
+        .header-title { font-size: 20px; font-weight: bold; color: #1e3a8a; background: linear-gradient(to right, #1e40af, #059669); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+
+        /* 操作区 */
+        .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 16px; }
+        select, input[type="number"], input[type="file"] { padding: 8px; border: 1px solid var(--border); border-radius: 4px; font-size: 14px; outline: none; }
+        select { background-color: #eff6ff; color: #1d4ed8; font-weight: bold; }
+        .btn-green { background-color: #dcfce7; color: #15803d; border: 1px solid #bbf7d0; padding: 8px 12px; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        .btn-blue { background-color: var(--primary); color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        .btn-orange { background-color: var(--orange); color: white; border: none; padding: 15px; border-radius: 8px; cursor: pointer; font-size: 18px; font-weight: bold; width: 100%; margin-top: 20px; }
+        .cost-display { margin-left: auto; text-align: right; }
+        .cost-display .label { font-size: 12px; color: #6b7280; }
+        .cost-display .value { font-size: 24px; font-weight: bold; color: var(--orange); font-family: monospace; }
+
+        /* 数据表格 */
+        .table-wrapper { overflow-x: auto; width: 100%; border: 1px solid var(--border); border-radius: 4px; margin-top: 10px; }
+        table { width: 100%; border-collapse: collapse; text-align: center; white-space: nowrap; min-width: 500px; }
+        th, td { padding: 10px 8px; border: 1px solid var(--border); font-size: 13px; }
+        th { background-color: #f8fafc; font-weight: 600; color: #475569; }
+        input[type="number"] { width: 100%; border: none; background: transparent; text-align: center; font-family: monospace; padding: 4px; }
+        input[type="number"]:focus { background-color: #eff6ff; outline: 1px solid var(--primary); border-radius: 2px; }
+        
+        /* 左右布局 */
+        .grid-2 { display: grid; grid-template-columns: 1fr; gap: 16px; }
+        @media (min-width: 768px) {
+            .grid-2 { grid-template-columns: 1fr 1fr; }
+            .btn-orange { width: auto; padding: 15px 50px; }
+            body { padding: 20px; }
+        }
+
+        .section-title { font-size: 14px; font-weight: bold; color: #374151; border-left: 4px solid var(--primary); padding-left: 8px; margin-bottom: 8px; }
+        .section-title.green { border-left-color: var(--emerald); }
+        .section-title.purple { border-left-color: #8b5cf6; }
+
+        /* 状态颜色 */
+        .text-green { color: #059669; font-weight: bold; font-family: monospace; }
+        .text-red { color: #dc2626; font-weight: bold; font-family: monospace; }
+        .text-gray { color: #9ca3af; font-family: monospace; }
+        .text-blue { color: var(--primary); font-weight: bold; font-family: monospace; }
+        
+        .status-pass { color: #059669; font-weight: bold; }
+        .status-fail { color: #dc2626; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <header class="header">
+        <div class="header-icon">
+            <svg width="24" height="24" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z"></path>
+            </svg>
+        </div>
+        <h1 class="header-title">FKX云端高级营养配方系统</h1>
+    </header>
+
+    <div class="card">
+        <div class="controls">
+            <select id="recipeSelector" onchange="loadRecipe()">
+                <option value="">-- 加载本地预设 --</option>
+            </select>
+            <span style="color:#d1d5db;">|</span>
+            <input type="file" id="ingFile" accept=".csv" class="hidden" onchange="handleFileSelect()">
+            <input type="file" id="nutFile" accept=".csv" class="hidden" onchange="handleFileSelect()">
+            <button class="btn-green" onclick="document.getElementById('ingFile').click()">1. 选原料CSV</button>
+            <button class="btn-green" onclick="document.getElementById('nutFile').click()">2. 选营养CSV</button>
+            <span id="uploadStatus" style="font-size:12px; color:#dc2626; font-weight:bold; margin-left:10px;"></span>
+        </div>
+
+        <div class="flex justify-between items-center mt-2">
+            <div class="cost-display">
+                <div class="label">总成本 (元/吨)</div>
+                <div class="value" id="displayCost">0.00</div>
+            </div>
+            <button class="btn-blue" onclick="exportExcel()" id="exportBtn">导出 Excel</button>
+        </div>
+    </div>
+
+    <div class="grid-2">
+        <div class="card">
+            <h2 class="section-title">原料数据库</h2>
+            <div class="table-wrapper">
+                <table id="ingredientTable">
+                    <thead>
+                        <tr><th>原料名称</th><th>价格(¥/t)</th><th>下限%</th><th>上限%</th><th>结果%</th></tr>
+                    </thead>
+                    <tbody><tr><td colspan="5" style="color:#9ca3af; padding:20px;">请选择或上传配方数据</td></tr></tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2 class="section-title green">营养指标限制</h2>
+            <div class="table-wrapper">
+                <table id="nutrientTable">
+                    <thead>
+                        <tr><th>营养素</th><th>最小值</th><th>最大值</th><th>计算结果</th><th>状态</th></tr>
+                    </thead>
+                    <tbody><tr><td colspan="5" style="color:#9ca3af; padding:20px;">请选择或上传配方数据</td></tr></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <div id="sensitivityPanel" class="card hidden mt-4">
+        <h2 class="section-title purple">📈 灵敏度分析</h2>
+        
+        <h3 style="font-size:12px; margin: 15px 0 8px 0; color:#4b5563;">1. 原料边界递减成本与价格范围</h3>
+        <div class="table-wrapper">
+            <table id="priceRangeTable">
+                <thead><tr><th>原料名称</th><th>递减成本</th><th>当前价格</th><th>价格下限</th><th>价格上限</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <h3 style="font-size:12px; margin: 20px 0 8px 0; color:#4b5563;">2. 营养指标影子价格与 RHS 允许范围</h3>
+        <div class="table-wrapper">
+            <table id="rhsRangeTable">
+                <thead>
+                    <tr>
+                        <th rowspan="2" style="border-right:2px solid #e2e8f0;">营养素</th>
+                        <th colspan="3" style="background:#eff6ff; border-right:1px solid #e2e8f0;">下界 (Min)</th>
+                        <th colspan="3" style="background:#fef2f2;">上界 (Max)</th>
+                    </tr>
+                    <tr>
+                        <th>影子价格</th><th>允许增加</th><th>允许减少</th>
+                        <th>影子价格</th><th>允许增加</th><th>允许减少</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="flex justify-center mb-4">
+        <button onclick="calculate()" id="calcBtn" class="btn-orange">运 行 计 算</button>
+    </div>
+
+    <script>
+        let ingredients = [];
+        let requirements = [];
+        let uploadedIngFile = null;
+        let uploadedNutFile = null;
+
+        window.onload = async () => {
+            try {
+                const res = await fetch('/api/files');
+                const data = await res.json();
+                const select = document.getElementById('recipeSelector');
+                data.recipes.forEach(r => {
+                    let opt = document.createElement('option');
+                    opt.value = r; opt.innerText = r;
+                    select.appendChild(opt);
+                });
+            } catch (e) {
+                console.error("加载列表失败", e);
+            }
+        };
+
+        function handleFileSelect() {
+            const ingInput = document.getElementById('ingFile');
+            const nutInput = document.getElementById('nutFile');
+            
+            if (ingInput.files.length > 0) uploadedIngFile = ingInput.files[0];
+            if (nutInput.files.length > 0) uploadedNutFile = nutInput.files[0];
+            
+            if (uploadedIngFile) document.getElementById('uploadStatus').innerText = "原料已选✅ ";
+            if (uploadedNutFile) document.getElementById('uploadStatus').innerText += "营养已选✅";
+            
+            if (uploadedIngFile && uploadedNutFile) {
+                uploadData();
+            }
+        }
+
+// 替换原有的 uploadData 函数
+function uploadData() {
+    const formData = new FormData();
+    formData.append("ing_file", uploadedIngFile);
+    formData.append("nut_file", uploadedNutFile);
+
+    document.getElementById('uploadStatus').innerText = "正在解析，请稍候...";
+
+    // 使用最稳定的 XMLHttpRequest
+    const xhr = new XMLHttpRequest();
+    // 强制使用当前页面的 origin，确保路径绝对正确
+    xhr.open("POST", window.location.origin + "/api/upload", true);
+
+    xhr.onload = function() {
+        if (xhr.status === 200) {
+            try {
+                const data = JSON.parse(xhr.responseText);
+                if (data.status === 'success') {
+                    processLoadedData(data);
+                    document.getElementById('uploadStatus').innerText = "✅ 上传成功";
+                    document.getElementById('recipeSelector').value = "";
+                    document.getElementById('ingFile').value = '';
+                    document.getElementById('nutFile').value = '';
+                    uploadedIngFile = null; uploadedNutFile = null;
+                } else {
+                    alert("解析失败: " + data.message);
+                    document.getElementById('uploadStatus').innerText = "❌ 解析失败";
+                }
+            } catch (e) {
+                alert("数据解析异常，请检查文件格式！");
+                document.getElementById('uploadStatus').innerText = "❌ 数据格式错误";
+            }
+        } else {
+            // 如果返回的不是 200，把状态码打出来
+            alert("服务器返回错误，状态码: " + xhr.status + "\n请确保后台 python main.py 正在运行！");
+            document.getElementById('uploadStatus').innerText = "❌ 上传异常 (HTTP " + xhr.status + ")";
+        }
+    };
+
+    xhr.onerror = function() {
+        alert("网络请求彻底失败！请检查手机网络或重启后台服务。");
+        document.getElementById('uploadStatus').innerText = "❌ 网络错误";
+    };
+
+    xhr.send(formData);
+}
+
+        async function loadRecipe() {
+            const name = document.getElementById('recipeSelector').value;
+            if (!name) return;
+            try {
+                document.getElementById('uploadStatus').innerText = "正在加载...";
+                const res = await fetch('/api/load', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ recipe_name: name })
+                });
+                const data = await res.json();
+                if (data.status === 'success') {
+                    processLoadedData(data);
+                    document.getElementById('uploadStatus').innerText = "✅ 预设加载成功";
+                } else {
+                    alert("加载失败: " + data.message);
+                    document.getElementById('uploadStatus').innerText = "❌ 加载失败";
+                }
+            } catch (e) {
+                alert("请求失败: " + e.message);
+            }
+        }
+
+        function processLoadedData(data) {
+            ingredients = data.ingredients.map(i => ({ name: i['原料名称'], price: i['价格'], min_limit: i['用量下限%'], max_limit: i['用量上限%'], ...i }));
+            requirements = data.requirements.map(r => ({ label: r['营养素'], min: r['下限'], max: r['上限'], ...r }));
+            renderTables();
+            document.getElementById('sensitivityPanel').classList.add('hidden');
+        }
+
+        function renderTables() {
+            document.querySelector("#ingredientTable tbody").innerHTML = ingredients.map((ing, i) => `
+                <tr>
+                    <td style="text-align:left; font-weight:500;">${ing.name}</td>
+                    <td><input type="number" value="${ing.price}" onchange="ingredients[${i}].price = parseFloat(this.value)"></td>
+                    <td><input type="number" value="${ing.min_limit}" onchange="ingredients[${i}].min_limit = parseFloat(this.value)"></td>
+                    <td><input type="number" value="${ing.max_limit}" onchange="ingredients[${i}].max_limit = parseFloat(this.value)"></td>
+                    <td id="res-ing-${i}" class="text-gray">-</td>
+                </tr>
+            `).join('');
+
+            document.querySelector("#nutrientTable tbody").innerHTML = requirements.map((req, i) => `
+                <tr>
+                    <td style="text-align:left; font-weight:500;">${req.label}</td>
+                    <td><input type="number" step="0.01" value="${req.min}" onchange="requirements[${i}].min = parseFloat(this.value)"></td>
+                    <td><input type="number" step="0.01" value="${req.max}" onchange="requirements[${i}].max = parseFloat(this.value)"></td>
+                    <td id="res-req-${i}" class="text-gray">-</td>
+                    <td id="res-status-${i}">-</td>
+                </tr>
+            `).join('');
+            document.getElementById('displayCost').innerText = "0.00";
+        }
+
+        async function calculate() {
+            if (ingredients.length === 0) return alert("请先加载或上传配方数据！");
+            const btn = document.getElementById('calcBtn');
+            btn.innerText = "计算中..."; btn.disabled = true;
+            
+            const payload = {
+                ingredients: ingredients.map(i => ({
+                    "原料名称": i.name, "价格": i.price, "用量下限%": i.min_limit, "用量上限%": i.max_limit,
+                    ...Object.fromEntries(requirements.map(r => [r.label, i[r.label]]))
+                })),
+                requirements: requirements.map(r => ({ "营养素": r.label, "下限": r.min, "上限": r.max }))
+            };
+
+            try {
+                const res = await fetch('/api/solve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                const data = await res.json();
+
+                if (data.status === "success") {
+                    document.getElementById('displayCost').innerText = data.total_cost.toFixed(2);
+                    data.recipe.forEach(item => {
+                        const idx = ingredients.findIndex(i => i.name === item['原料名称']);
+                        if (idx !== -1) {
+                            const el = document.getElementById(`res-ing-${idx}`);
+                            el.innerText = item['结果%'].toFixed(2) + "%";
+                            el.className = item['结果%'] > 0 ? "text-green" : "text-gray";
+                        }
+                    });
+                    data.nutrients.forEach(item => {
+                        const idx = requirements.findIndex(r => r.label === item['营养素']);
+                        if (idx !== -1) {
+                            document.getElementById(`res-req-${idx}`).innerText = item['结果'].toFixed(2);
+                            document.getElementById(`res-req-${idx}`).className = "text-blue";
+                            const stEl = document.getElementById(`res-status-${idx}`);
+                            stEl.innerText = item['状态'];
+                            stEl.className = item['状态'] === "达标" ? "status-pass" : "status-fail";
+                        }
+                    });
+                    renderSensitivityTables(data.recipe, data.nutrients);
+                } else {
+                    alert(data.message);
+                }
+            } catch (err) {
+                alert("网络连接失败或计算超时");
+            } finally {
+                btn.innerText = "运 行 计 算"; btn.disabled = false;
+            }
+        }
+
+        function renderSensitivityTables(recipeData, nutrientData) {
+            document.querySelector("#priceRangeTable tbody").innerHTML = recipeData.map(r => `
+                <tr>
+                    <td style="text-align:left; font-weight:500;">${r['原料名称']}</td>
+                    <td class="${r['递减成本'] < 0 ? 'text-red' : (r['递减成本'] > 0 ? 'text-green' : 'text-gray')}">${r['递减成本']}</td>
+                    <td class="text-gray">${r['当前价格']}</td>
+                    <td class="text-blue">${r['价格下限']}</td>
+                    <td class="text-blue">${r['价格上限']}</td>
+                </tr>
+            `).join('');
+
+            document.querySelector("#rhsRangeTable tbody").innerHTML = nutrientData.map(n => `
+                <tr>
+                    <td style="text-align:left; font-weight:500; border-right:2px solid #e2e8f0;">${n['营养素']}</td>
+                    <td class="text-green">${n['下界影子价格']}</td>
+                    <td class="text-gray">${n['下界允许增加']}</td>
+                    <td class="text-gray" style="border-right:1px solid #e2e8f0;">${n['下界允许减少']}</td>
+                    <td class="text-red">${n['上界影子价格']}</td>
+                    <td class="text-gray">${n['上界允许增加']}</td>
+                    <td class="text-gray">${n['上界允许减少']}</td>
+                </tr>
+            `).join('');
+            document.getElementById('sensitivityPanel').classList.remove('hidden');
+        }
+
+        async function exportExcel() {
+            if (ingredients.length === 0) return alert("没有数据可导出！");
+            const btn = document.getElementById('exportBtn'); btn.innerText = "生成中..."; btn.disabled = true;
+            const payload = {
+                ingredients: ingredients.map(i => ({
+                    "原料名称": i.name, "价格": i.price, "用量下限%": i.min_limit, "用量上限%": i.max_limit,
+                    ...Object.fromEntries(requirements.map(r => [r.label, i[r.label]]))
+                })),
+                requirements: requirements.map(r => ({ "营养素": r.label, "下限": r.min, "上限": r.max }))
+            };
+            try {
+                const res = await fetch('/api/export', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                if (res.ok) {
+                    const blob = await res.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url; a.download = "配方灵敏度分析报告.xlsx";
+                    document.body.appendChild(a); a.click(); a.remove();
+                } else {
+                    alert("导出失败，可能是配方无解。");
+                }
+            } catch (err) {
+                alert("导出请求失败");
+            } finally {
+                btn.innerText = "导出 Excel"; btn.disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>
