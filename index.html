@@ -309,7 +309,6 @@
             finally { btn.innerText = "运 行 计 算"; btn.disabled = false; }
         }
 
-        // 动态判断影子价格的颜色：>0 红(增加成本)，<0 绿(降低成本)
         function getShadowPriceClass(val) {
             if (val > 0) return 'text-red';
             if (val < 0) return 'text-green';

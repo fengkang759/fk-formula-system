@@ -131,15 +131,24 @@ def run_lp(ing_data, req_data):
     except Exception:
         return None
 
-    # 3. 提取基准解
+    # 3. 提取基准解 (修复递减成本的计算方式)
     cost_base = pyo.value(model.cost)
     x_base = {i: pyo.value(model.x[i]) for i in ingredients}
-    rc_base = {i: model.rc.get(model.x[i], 0.0) for i in ingredients}
     
     dual_ing_lb = {i: model.dual.get(model.c_ing_lb[i], 0.0) for i in ingredients}
     dual_ing_ub = {i: model.dual.get(model.c_ing_ub[i], 0.0) for i in ingredients}
     dual_nut_lb = {j: model.dual.get(model.c_nut_lb[j], 0.0) for j in nutrient_names}
     dual_nut_ub = {j: model.dual.get(model.c_nut_ub[j], 0.0) for j in nutrient_names}
+
+    # 【关键修改】：用影子价格手动推导递减成本 (解决 highs 求解器 rc 为 0 的问题)
+    rc_base = {}
+    for i in ingredients:
+        if abs(x_base[i] - lb_ing_base[ingredients.index(i)]) < 1e-5:
+            rc_base[i] = dual_ing_lb[i]  # 如果在下界，递减成本即下界影子价格
+        elif abs(x_base[i] - ub_ing_base[ingredients.index(i)]) < 1e-5:
+            rc_base[i] = dual_ing_ub[i]  # 如果在上界，递减成本即上界影子价格
+        else:
+            rc_base[i] = 0.0  # 如果在中间，递减成本为 0
 
     # 4. 二分搜索核心逻辑
     TOL_X = 1e-4
@@ -198,7 +207,6 @@ def run_lp(ing_data, req_data):
     for i, ing in enumerate(ingredients):
         qty = x_base[ing] * 100
         
-        # 【微调】：限制价格搜索范围为当前价格的 10% ~ 10 倍
         min_p_limit = max(0.0, price_base[i] * 0.1)
         max_p_limit = price_base[i] * 10.0
         
@@ -213,7 +221,7 @@ def run_lp(ing_data, req_data):
         result_recipe.append({
             "原料名称": ing,
             "结果%": round(qty, 4),
-            "递减成本": round(rc_base[ing], 4),
+            "递减成本": round(rc_base[ing], 4), # 现在这里会正确显示非零值了
             "当前价格": float(price_base[i]),
             "价格下限": round(float(price_base[i] - p_dec), 2),
             "价格上限": round(float(price_base[i] + p_inc), 2),
