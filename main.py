@@ -139,7 +139,6 @@ def run_lp(ing_data, req_data):
     is_fixed = {}
     for i in ingredients:
         idx = ingredients.index(i)
-        # 判断是否为固定变量（上下限相等）
         if abs(ub_ing_base[idx] - lb_ing_base[idx]) < 1e-6:
             is_fixed[i] = True
             rc_base[i] = 0.0
@@ -152,9 +151,8 @@ def run_lp(ing_data, req_data):
             else:
                 rc_base[i] = 0.0
 
-    # 4. 二分搜索核心逻辑 (修正退化问题)
-    TOL_X = 1e-3 # 放宽一点的基不变判定阈值，吸收浮点误差
-    MAX_BOUND = 1e6 
+    # 4. 二分搜索核心逻辑 (精确边界检测)
+    MAX_BOUND = 1e5 
     
     def solve_attempt():
         try:
@@ -164,10 +162,12 @@ def run_lp(ing_data, req_data):
             return False
 
     def basis_unchanged():
-        # 只要配方用量 x 没发生根本性变化，视为基不变（不受价格乘以用量的影响）
-        return all(abs(pyo.value(model.x[i]) - x_base[i]) <= TOL_X for i in ingredients)
+        return all(abs(pyo.value(model.x[i]) - x_base[i]) <= 1e-4 for i in ingredients)
 
-    def binary_search_bound(param, base_val, lower_limit, upper_limit, direction):
+    def make_dual_check(constraint_obj, base_dual):
+        return lambda: abs(model.dual.get(constraint_obj, 0.0) - base_dual) <= 1e-4
+
+    def binary_search_bound(param, base_val, lower_limit, upper_limit, direction, check_func):
         step = max(abs(base_val) * 0.1, 0.1)
         low, high = base_val, base_val
         
@@ -177,15 +177,16 @@ def run_lp(ing_data, req_data):
                 if high > upper_limit:
                     high = upper_limit
                     param.set_value(high)
-                    if not solve_attempt() or not basis_unchanged(): break
-                    param.set_value(base_val); solve_attempt(); return high - base_val
+                    if not solve_attempt() or not check_func(): break
+                    param.set_value(base_val); solve_attempt()
+                    return None if upper_limit >= MAX_BOUND or upper_limit >= 1.0 else (high - base_val)
                 param.set_value(high)
-                if not solve_attempt() or not basis_unchanged(): break
+                if not solve_attempt() or not check_func(): break
                 low = high; step *= 2
-            while high - low > max(0.001, abs(high)*1e-4):
+            while high - low > max(0.0001, abs(high)*1e-5):
                 mid = (low + high) / 2
                 param.set_value(mid)
-                if solve_attempt() and basis_unchanged(): low = mid
+                if solve_attempt() and check_func(): low = mid
                 else: high = mid
             param.set_value(base_val); solve_attempt(); return low - base_val
         else:
@@ -194,15 +195,16 @@ def run_lp(ing_data, req_data):
                 if high < lower_limit:
                     high = lower_limit
                     param.set_value(high)
-                    if not solve_attempt() or not basis_unchanged(): break
-                    param.set_value(base_val); solve_attempt(); return base_val - high
+                    if not solve_attempt() or not check_func(): break
+                    param.set_value(base_val); solve_attempt()
+                    return base_val - high
                 param.set_value(high)
-                if not solve_attempt() or not basis_unchanged(): break
+                if not solve_attempt() or not check_func(): break
                 low = high; step *= 2
-            while low - high > max(0.001, abs(low)*1e-4):
+            while low - high > max(0.0001, abs(low)*1e-5):
                 mid = (low + high) / 2
                 param.set_value(mid)
-                if solve_attempt() and basis_unchanged(): low = mid
+                if solve_attempt() and check_func(): low = mid
                 else: high = mid
             param.set_value(base_val); solve_attempt(); return base_val - low
 
@@ -211,21 +213,23 @@ def run_lp(ing_data, req_data):
     for i, ing in enumerate(ingredients):
         qty = x_base[ing] * 100
         
-        p_inc = binary_search_bound(model.price[ing], price_base[i], 0, MAX_BOUND, 'increase')
-        p_dec = binary_search_bound(model.price[ing], price_base[i], 0, MAX_BOUND, 'decrease')
+        p_inc = binary_search_bound(model.price[ing], price_base[i], 0, MAX_BOUND, 'increase', basis_unchanged)
+        p_dec = binary_search_bound(model.price[ing], price_base[i], 0, MAX_BOUND, 'decrease', basis_unchanged)
         
         if is_fixed[ing]:
             ing_inc_lb = ing_dec_lb = ing_inc_ub = ing_dec_ub = 0.0
             dual_ing_lb_val = dual_ing_ub_val = 0.0
         else:
-            ing_inc_lb = binary_search_bound(model.lb_ing[ing], lb_ing_base[i], 0, 1.0, 'increase')
-            ing_dec_lb = binary_search_bound(model.lb_ing[ing], lb_ing_base[i], 0, 1.0, 'decrease')
-            ing_inc_ub = binary_search_bound(model.ub_ing[ing], ub_ing_base[i], 0, 1.0, 'increase')
-            ing_dec_ub = binary_search_bound(model.ub_ing[ing], ub_ing_base[i], 0, 1.0, 'decrease')
+            check_lb = make_dual_check(model.c_ing_lb[ing], dual_ing_lb[ing])
+            check_ub = make_dual_check(model.c_ing_ub[ing], dual_ing_ub[ing])
+            
+            ing_inc_lb = binary_search_bound(model.lb_ing[ing], lb_ing_base[i], 0, 1.0, 'increase', check_lb)
+            ing_dec_lb = binary_search_bound(model.lb_ing[ing], lb_ing_base[i], 0, 1.0, 'decrease', check_lb)
+            ing_inc_ub = binary_search_bound(model.ub_ing[ing], ub_ing_base[i], 0, 1.0, 'increase', check_ub)
+            ing_dec_ub = binary_search_bound(model.ub_ing[ing], ub_ing_base[i], 0, 1.0, 'decrease', check_ub)
             dual_ing_lb_val = dual_ing_lb[ing]
             dual_ing_ub_val = dual_ing_ub[ing]
 
-        # 统一换算为每 1% 变动的经济指标
         rc_1pct = rc_base[ing] / 100
         dual_ing_lb_1pct = dual_ing_lb_val / 100
         dual_ing_ub_1pct = dual_ing_ub_val / 100
@@ -236,14 +240,14 @@ def run_lp(ing_data, req_data):
             "结果%": round(qty, 4),
             "递减成本": round(rc_1pct, 4) if not is_fixed[ing] else None,
             "当前价格": float(price_base[i]),
-            "价格下限": round(float(price_base[i] - p_dec), 2) if p_dec < MAX_BOUND else "0",
-            "价格上限": round(float(price_base[i] + p_inc), 2) if p_inc < MAX_BOUND else "∞",
+            "价格下限": "0" if p_dec is None else round(float(price_base[i] - p_dec), 2),
+            "价格上限": "∞" if p_inc is None else round(float(price_base[i] + p_inc), 2),
             "下限影子价格": round(float(dual_ing_lb_1pct), 4) if not is_fixed[ing] else None,
             "上限影子价格": round(float(dual_ing_ub_1pct), 4) if not is_fixed[ing] else None,
-            "下限允许增加": round(float(ing_inc_lb * 100), 2) if not is_fixed[ing] and ing_inc_lb < 1.0 else ("-" if is_fixed[ing] else "∞"),
-            "下限允许减少": round(float(ing_dec_lb * 100), 2) if not is_fixed[ing] and ing_dec_lb < 1.0 else ("-" if is_fixed[ing] else "∞"),
-            "上限允许增加": round(float(ing_inc_ub * 100), 2) if not is_fixed[ing] and ing_inc_ub < 1.0 else ("-" if is_fixed[ing] else "∞"),
-            "上限允许减少": round(float(ing_dec_ub * 100), 2) if not is_fixed[ing] and ing_dec_ub < 1.0 else ("-" if is_fixed[ing] else "∞")
+            "下限允许增加": "-" if is_fixed[ing] else ("∞" if ing_inc_lb is None else round(float(ing_inc_lb * 100), 2)),
+            "下限允许减少": "-" if is_fixed[ing] else ("∞" if ing_dec_lb is None else round(float(ing_dec_lb * 100), 2)),
+            "上限允许增加": "-" if is_fixed[ing] else ("∞" if ing_inc_ub is None else round(float(ing_inc_ub * 100), 2)),
+            "上限允许减少": "-" if is_fixed[ing] else ("∞" if ing_dec_ub is None else round(float(ing_dec_ub * 100), 2))
         })
 
     # 6. 计算营养素灵敏度
@@ -251,10 +255,13 @@ def run_lp(ing_data, req_data):
     for j, nut in enumerate(nutrient_names):
         actual = sum(content[ingredients.index(i), nutrient_names.index(nut)] * x_base[i] for i in ingredients)
         
-        n_inc_lb = binary_search_bound(model.lb_nut[nut], lb_nut_base[j], 0, MAX_BOUND, 'increase') 
-        n_dec_lb = binary_search_bound(model.lb_nut[nut], lb_nut_base[j], 0, MAX_BOUND, 'decrease')
-        n_inc_ub = binary_search_bound(model.ub_nut[nut], ub_nut_base[j], 0, MAX_BOUND, 'increase')
-        n_dec_ub = binary_search_bound(model.ub_nut[nut], ub_nut_base[j], 0, MAX_BOUND, 'decrease')
+        check_lb = make_dual_check(model.c_nut_lb[nut], dual_nut_lb[nut])
+        check_ub = make_dual_check(model.c_nut_ub[nut], dual_nut_ub[nut])
+        
+        n_inc_lb = binary_search_bound(model.lb_nut[nut], lb_nut_base[j], 0, MAX_BOUND, 'increase', check_lb) 
+        n_dec_lb = binary_search_bound(model.lb_nut[nut], lb_nut_base[j], 0, MAX_BOUND, 'decrease', check_lb)
+        n_inc_ub = binary_search_bound(model.ub_nut[nut], ub_nut_base[j], 0, MAX_BOUND, 'increase', check_ub)
+        n_dec_ub = binary_search_bound(model.ub_nut[nut], ub_nut_base[j], 0, MAX_BOUND, 'decrease', check_ub)
         
         result_nutrients.append({
             "营养素": nut,
@@ -263,11 +270,11 @@ def run_lp(ing_data, req_data):
             "上限": float(ub_nut_base[j]),
             "状态": "达标" if (lb_nut_base[j] - 1e-4) <= actual <= (ub_nut_base[j] + 1e-4) else "不达标",
             "下界影子价格": round(float(dual_nut_lb[nut]), 4),
-            "下界允许增加": round(float(n_inc_lb), 2) if n_inc_lb < 1e5 else "∞",
-            "下界允许减少": round(float(n_dec_lb), 2) if n_dec_lb < 1e5 else "∞",
+            "下界允许增加": "∞" if n_inc_lb is None else round(float(n_inc_lb), 2),
+            "下界允许减少": "∞" if n_dec_lb is None else round(float(n_dec_lb), 2),
             "上界影子价格": round(float(dual_nut_ub[nut]), 4),
-            "上界允许增加": round(float(n_inc_ub), 2) if n_inc_ub < 1e5 else "∞",
-            "上界允许减少": round(float(n_dec_ub), 2) if n_dec_ub < 1e5 else "∞"
+            "上界允许增加": "∞" if n_inc_ub is None else round(float(n_inc_ub), 2),
+            "上界允许减少": "∞" if n_dec_ub is None else round(float(n_dec_ub), 2)
         })
 
     return {
@@ -306,43 +313,52 @@ def beautify_excel(writer, sheet_name, df, start_row=0):
 
 @app.post("/api/export")
 def export_excel(req: SolveRequest):
-    result = run_lp(req.ingredients, req.requirements)
-    if result is None:
-        return Response(content="无可行解，无法导出", media_type="text/plain")
+    try:
+        result = run_lp(req.ingredients, req.requirements)
+        if result is None:
+            return Response(content="无可行解，无法导出", media_type="text/plain", status_code=400)
 
-    excel_buffer = io.BytesIO()
-    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-        df_summary = pd.DataFrame({'项目': ['最优总成本'], '数值': [result['total_cost']], '单位': ['元/吨']})
-        
-        df_recipe = pd.DataFrame(result['recipe'])
-        df_recipe.fillna('', inplace=True)
-        df_recipe_export = df_recipe[['原料名称', '结果%', '当前价格', '价格下限', '价格上限']]
-        
-        df_summary.to_excel(writer, sheet_name="配方与成本", index=False, startrow=0)
-        df_recipe_export.to_excel(writer, sheet_name="配方与成本", index=False, startrow=3)
-        beautify_excel(writer, "配方与成本", df_summary, 0)
-        beautify_excel(writer, "配方与成本", df_recipe_export, 3)
+        excel_buffer = io.BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+            df_summary = pd.DataFrame({'项目': ['最优总成本'], '数值': [result['total_cost']], '单位': ['元/吨']})
+            
+            df_recipe = pd.DataFrame(result['recipe'])
+            df_recipe = df_recipe.fillna('-')
+            for col in df_recipe.columns:
+                df_recipe[col] = df_recipe[col].astype(object)
+            df_recipe_export = df_recipe[['原料名称', '结果%', '当前价格', '价格下限', '价格上限']].copy()
+            
+            df_summary.to_excel(writer, sheet_name="配方与成本", index=False, startrow=0)
+            df_recipe_export.to_excel(writer, sheet_name="配方与成本", index=False, startrow=3)
+            beautify_excel(writer, "配方与成本", df_summary, 0)
+            beautify_excel(writer, "配方与成本", df_recipe_export, 3)
 
-        df_nut = pd.DataFrame(result['nutrients'])
-        df_nut.fillna('', inplace=True)
-        df_nut_export = df_nut[['营养素', '结果', '下限', '上限', '状态', '下界影子价格', '上界影子价格']]
-        df_nut_export.to_excel(writer, sheet_name="营养分析", index=False)
-        beautify_excel(writer, "营养分析", df_nut_export)
+            df_nut = pd.DataFrame(result['nutrients'])
+            df_nut = df_nut.fillna('-')
+            for col in df_nut.columns:
+                df_nut[col] = df_nut[col].astype(object)
+            df_nut_export = df_nut[['营养素', '结果', '下限', '上限', '状态', '下界影子价格', '上界影子价格']].copy()
+            df_nut_export.to_excel(writer, sheet_name="营养分析", index=False)
+            beautify_excel(writer, "营养分析", df_nut_export)
 
-        df_sens_nut = df_nut[['营养素', '下界允许增加', '下界允许减少', '上界允许增加', '上界允许减少']]
-        df_sens_nut.to_excel(writer, sheet_name="营养灵敏度", index=False)
-        beautify_excel(writer, "营养灵敏度", df_sens_nut)
+            df_sens_nut = df_nut[['营养素', '下界允许增加', '下界允许减少', '上界允许增加', '上界允许减少']].copy()
+            df_sens_nut.to_excel(writer, sheet_name="营养灵敏度", index=False)
+            beautify_excel(writer, "营养灵敏度", df_sens_nut)
 
-        df_sens_ing = df_recipe[['原料名称', '递减成本', '下限影子价格', '下限允许增加', '下限允许减少', '上限影子价格', '上限允许增加', '上限允许减少']]
-        df_sens_ing.to_excel(writer, sheet_name="原料灵敏度", index=False)
-        beautify_excel(writer, "原料灵敏度", df_sens_ing)
+            df_sens_ing = df_recipe[['原料名称', '递减成本', '下限影子价格', '下限允许增加', '下限允许减少', '上限影子价格', '上限允许增加', '上限允许减少']].copy()
+            df_sens_ing.to_excel(writer, sheet_name="原料灵敏度", index=False)
+            beautify_excel(writer, "原料灵敏度", df_sens_ing)
 
-    excel_buffer.seek(0)
-    return Response(
-        content=excel_buffer.getvalue(), 
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 
-        headers={"Content-Disposition": "attachment; filename=feed_formula_report.xlsx"}
-    )
+        excel_buffer.seek(0)
+        return Response(
+            content=excel_buffer.getvalue(), 
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 
+            headers={"Content-Disposition": "attachment; filename=feed_formula_report.xlsx"}
+        )
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return Response(content=f"服务器导出错误: {str(e)}", media_type="text/plain", status_code=500)
 
 if __name__ == "__main__":
     import uvicorn

@@ -389,8 +389,11 @@
                     const a = document.createElement('a');
                     a.href = url; a.download = "FKX配方分析报告.xlsx";
                     document.body.appendChild(a); a.click(); a.remove();
-                } else { alert("导出失败，可能是配方无解。"); }
-            } catch (err) { alert("导出请求失败"); } 
+                } else { 
+                    const text = await res.text();
+                    alert("导出失败: " + text); 
+                }
+            } catch (err) { alert("导出请求失败: " + err.message); } 
             finally { btn.innerText = "导出 Excel"; btn.disabled = false; }
         }
     </script>
