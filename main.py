@@ -35,29 +35,22 @@ def read_index():
 def get_available_files():
     files = glob.glob('*_ingredients.csv')
     recipes = [f.replace('_ingredients.csv', '') for f in files]
-    print(f"后端扫描到的配方: {recipes}")
     return {"recipes": recipes}
 
-# ================== 1. 本地加载接口 ==================
 @app.post("/api/load")
 def load_recipe_data(req: LoadRequest):
     recipe_name = req.recipe_name
-    print(f"正在尝试加载配方: {recipe_name}")
-    
     ing_file = f"{recipe_name}_ingredients.csv"
     nut_file = f"{recipe_name}_nutrition.csv"
     
     if not os.path.exists(ing_file) or not os.path.exists(nut_file):
         return {"status": "error", "message": f"找不到文件"}
-    
     try:
         df_ing = pd.read_csv(ing_file, encoding='utf-8-sig')
         df_nut = pd.read_csv(nut_file, encoding='utf-8-sig')
-        
         df_ing.columns = df_ing.columns.str.strip()
         df_nut.columns = df_nut.columns.str.strip()
         df_nut = df_nut.fillna(0)
-        
         return {
             "status": "success",
             "ingredients": df_ing.to_dict(orient='records'),
@@ -66,20 +59,16 @@ def load_recipe_data(req: LoadRequest):
     except Exception as e:
         return {"status": "error", "message": f"文件解析失败: {str(e)}"}
 
-# ================== 2. 自定义上传接口 ==================
 @app.post("/api/upload")
 async def upload_csv(ing_file: UploadFile = File(...), nut_file: UploadFile = File(...)):
     try:
         content_ing = await ing_file.read()
         content_nut = await nut_file.read()
-        
         df_ing = pd.read_csv(io.BytesIO(content_ing), encoding='utf-8-sig')
         df_nut = pd.read_csv(io.BytesIO(content_nut), encoding='utf-8-sig')
-        
         df_ing.columns = df_ing.columns.str.strip()
         df_nut.columns = df_nut.columns.str.strip()
         df_nut = df_nut.fillna(0)
-        
         return {
             "status": "success",
             "ingredients": df_ing.to_dict(orient='records'),
@@ -88,8 +77,9 @@ async def upload_csv(ing_file: UploadFile = File(...), nut_file: UploadFile = Fi
     except Exception as e:
         return {"status": "error", "message": f"文件解析失败: {str(e)}"}
 
-# ================== 3. 核心求解逻辑 ==================
+# ================== 核心求解与灵敏度分析 ==================
 def run_lp(ing_data, req_data):
+    # 1. 提取基础数据
     ingredients = [i['原料名称'] for i in ing_data]
     n_ing = len(ingredients)
     
@@ -97,27 +87,38 @@ def run_lp(ing_data, req_data):
     df_req = pd.DataFrame(req_data)
     
     nutrient_names = df_req['营养素'].tolist()
+    n_nut = len(nutrient_names)
+
     lb_nut_base = df_req['下限'].values
     ub_nut_base = df_req['上限'].values
     content = df_ing[nutrient_names].values
-
     price_base = df_ing['价格'].values
-    lb_ing = df_ing['用量下限%'].values / 100
-    ub_ing = df_ing['用量上限%'].values / 100
+    lb_ing_base = df_ing['用量下限%'].values / 100
+    ub_ing_base = df_ing['用量上限%'].values / 100
 
+    # 2. 构建 Pyomo 模型
     model = pyo.ConcreteModel()
-    model.x = pyo.Var(ingredients, bounds=lambda m, i: (lb_ing[ingredients.index(i)], ub_ing[ingredients.index(i)]))
-    model.price = pyo.Param(range(n_ing), initialize=price_base.tolist(), mutable=True, within=pyo.Reals)
-    model.lb_nut = pyo.Param(range(len(nutrient_names)), initialize=lb_nut_base.tolist(), mutable=True, within=pyo.Reals)
-    model.ub_nut = pyo.Param(range(len(nutrient_names)), initialize=ub_nut_base.tolist(), mutable=True, within=pyo.Reals)
-    model.cost = pyo.Objective(expr=sum(model.price[i] * model.x[ingredients[i]] for i in range(n_ing)), sense=pyo.minimize)
     
-    model.nutrient_constraints = pyo.ConstraintList()
-    for j, nut in enumerate(nutrient_names):
-        expr = sum(content[i, j] * model.x[ingredients[i]] for i in range(n_ing))
-        model.nutrient_constraints.add(expr >= model.lb_nut[j])
-        model.nutrient_constraints.add(expr <= model.ub_nut[j])
-    model.total_constraint = pyo.Constraint(expr=sum(model.x[i] for i in ingredients) == 1)
+    model.x = pyo.Var(ingredients)
+    model.price = pyo.Param(ingredients, initialize=lambda m, i: price_base[ingredients.index(i)], mutable=True)
+    model.lb_ing = pyo.Param(ingredients, initialize=lambda m, i: lb_ing_base[ingredients.index(i)], mutable=True)
+    model.ub_ing = pyo.Param(ingredients, initialize=lambda m, i: ub_ing_base[ingredients.index(i)], mutable=True)
+    
+    model.lb_nut = pyo.Param(nutrient_names, initialize=lambda m, j: lb_nut_base[nutrient_names.index(j)], mutable=True)
+    model.ub_nut = pyo.Param(nutrient_names, initialize=lambda m, j: ub_nut_base[nutrient_names.index(j)], mutable=True)
+
+    model.c_ing_lb = pyo.Constraint(ingredients, rule=lambda m, i: m.x[i] >= m.lb_ing[i])
+    model.c_ing_ub = pyo.Constraint(ingredients, rule=lambda m, i: m.x[i] <= m.ub_ing[i])
+    
+    def nut_rule_lb(m, j):
+        return sum(content[ingredients.index(i), nutrient_names.index(j)] * m.x[i] for i in ingredients) >= m.lb_nut[j]
+    def nut_rule_ub(m, j):
+        return sum(content[ingredients.index(i), nutrient_names.index(j)] * m.x[i] for i in ingredients) <= m.ub_nut[j]
+    model.c_nut_lb = pyo.Constraint(nutrient_names, rule=nut_rule_lb)
+    model.c_nut_ub = pyo.Constraint(nutrient_names, rule=nut_rule_ub)
+    
+    model.c_total = pyo.Constraint(expr=sum(model.x[i] for i in ingredients) == 1)
+    model.cost = pyo.Objective(expr=sum(model.price[i] * model.x[i] for i in ingredients), sense=pyo.minimize)
 
     model.dual = Suffix(direction=Suffix.IMPORT)
     model.rc = Suffix(direction=Suffix.IMPORT)
@@ -130,154 +131,122 @@ def run_lp(ing_data, req_data):
     except Exception:
         return None
 
+    # 3. 提取基准解
     cost_base = pyo.value(model.cost)
-    x_base = {i: pyo.value(model.x[ingredients[i]]) for i in range(n_ing)}
-    dual_total_base = model.dual.get(model.total_constraint, None)
-    dual_lb_base = {j: model.dual.get(model.nutrient_constraints[j*2 + 1], None) for j in range(len(nutrient_names))}
-    dual_ub_base = {j: model.dual.get(model.nutrient_constraints[j*2 + 2], None) for j in range(len(nutrient_names))}
-    rc_base = {i: model.rc.get(model.x[ingredients[i]], None) for i in range(n_ing)}
+    x_base = {i: pyo.value(model.x[i]) for i in ingredients}
+    rc_base = {i: model.rc.get(model.x[i], 0.0) for i in ingredients}
+    
+    dual_ing_lb = {i: model.dual.get(model.c_ing_lb[i], 0.0) for i in ingredients}
+    dual_ing_ub = {i: model.dual.get(model.c_ing_ub[i], 0.0) for i in ingredients}
+    dual_nut_lb = {j: model.dual.get(model.c_nut_lb[j], 0.0) for j in nutrient_names}
+    dual_nut_ub = {j: model.dual.get(model.c_nut_ub[j], 0.0) for j in nutrient_names}
 
-    TOL = 0.01 
-    PRICE_MIN, PRICE_MAX = 0.0, 1e7
-    NUT_MIN, NUT_MAX = 0.0, 100.0
-    energy_keywords = ['代谢能', '能量KC', '虾代谢能KC', '禽代谢能KC', '代谢能KC']
-    ENERGY_IDX = next((nutrient_names.index(k) for k in energy_keywords if k in nutrient_names), None)
-    NUT_MAX_ENERGY = 10000
-
-    def get_nut_phys_bound(j, is_lb):
-        return (NUT_MIN if is_lb else NUT_MAX_ENERGY) if (ENERGY_IDX is not None and j == ENERGY_IDX) else (NUT_MIN if is_lb else NUT_MAX)
-
+    # 4. 二分搜索核心逻辑
+    TOL_X = 1e-4
+    
     def solve_attempt():
         try:
             res = solver.solve(model, tee=False, load_solutions=True)
-            if res.solver.status == pyo.SolverStatus.ok and res.solver.termination_condition == pyo.TerminationCondition.optimal:
-                return True
+            return res.solver.status == pyo.SolverStatus.ok and res.solver.termination_condition == pyo.TerminationCondition.optimal
         except Exception:
-            pass
-        return False
+            return False
 
-    def basis_unchanged(mode='price'):
-        if mode == 'price':
-            return all(abs(pyo.value(model.x[ingredients[i]]) - x_base[i]) <= TOL for i in range(n_ing))
-        else:
-            dual_total_new = model.dual.get(model.total_constraint, None)
-            if abs((dual_total_new or 0) - (dual_total_base or 0)) > TOL: return False
-            for j in range(len(nutrient_names)):
-                lb_new = model.dual.get(model.nutrient_constraints[j*2 + 1], None)
-                ub_new = model.dual.get(model.nutrient_constraints[j*2 + 2], None)
-                if abs((lb_new or 0) - (dual_lb_base[j] or 0)) > TOL: return False
-                if abs((ub_new or 0) - (dual_ub_base[j] or 0)) > TOL: return False
-            return True
+    def basis_unchanged():
+        return all(abs(pyo.value(model.x[i]) - x_base[i]) <= TOL_X for i in ingredients)
 
-    def price_range(i, direction):
-        base = price_base[i]
-        step = max(base * 0.1, 1.0)
+    def binary_search_bound(param, base_val, physical_limit, direction):
+        step = max(abs(base_val) * 0.1, 0.1)
+        low, high = base_val, base_val
+        
         if direction == 'increase':
-            low, high = base, base
             while True:
-                high = base + step
-                if high > PRICE_MAX:
-                    high = PRICE_MAX; model.price[i] = high
-                    if not solve_attempt() or not basis_unchanged('price'): break
-                    else: model.price[i] = base; solve_attempt(); return high - base
-                model.price[i] = high
-                if not solve_attempt() or not basis_unchanged('price'): break
+                high = base_val + step
+                if high > physical_limit:
+                    high = physical_limit
+                    param.set_value(high)
+                    if not solve_attempt() or not basis_unchanged(): break
+                    param.set_value(base_val); solve_attempt(); return high - base_val
+                param.set_value(high)
+                if not solve_attempt() or not basis_unchanged(): break
                 low = high; step *= 2
-            while high - low > TOL:
-                mid = (low + high) / 2; model.price[i] = mid
-                if solve_attempt() and basis_unchanged('price'): low = mid
+            while high - low > max(0.01, abs(high)*1e-4):
+                mid = (low + high) / 2
+                param.set_value(mid)
+                if solve_attempt() and basis_unchanged(): low = mid
                 else: high = mid
-            model.price[i] = base; solve_attempt(); return low - base
-        else: 
-            low, high = base, base
-            while True:
-                high = base - step
-                if high < PRICE_MIN:
-                    high = PRICE_MIN; model.price[i] = high
-                    if not solve_attempt() or not basis_unchanged('price'): break
-                    else: model.price[i] = base; solve_attempt(); return base - high
-                model.price[i] = high
-                if not solve_attempt() or not basis_unchanged('price'): break
-                low = high; step *= 2
-            while low - high > TOL:
-                mid = (low + high) / 2; model.price[i] = mid
-                if solve_attempt() and basis_unchanged('price'): low = mid
-                else: high = mid
-            model.price[i] = base; solve_attempt(); return base - low
-
-    def nutrient_range(j, bound_type, direction):
-        param = model.lb_nut if bound_type == 'lb' else model.ub_nut
-        base = lb_nut_base[j] if bound_type == 'lb' else ub_nut_base[j]
-        phys_low, phys_high = get_nut_phys_bound(j, True), get_nut_phys_bound(j, False)
-        step = max(base * 0.1, 0.1)
-        if direction == 'increase':
-            low, high = base, base
-            while True:
-                high = base + step
-                if high > phys_high:
-                    high = phys_high; param[j] = high
-                    if not solve_attempt() or not basis_unchanged('rhs'): break
-                    else: param[j] = base; solve_attempt(); return high - base
-                param[j] = high
-                if not solve_attempt() or not basis_unchanged('rhs'): break
-                low = high; step *= 2
-            while high - low > TOL:
-                mid = (low + high) / 2; param[j] = mid
-                if solve_attempt() and basis_unchanged('rhs'): low = mid
-                else: high = mid
-            param[j] = base; solve_attempt(); return low - base
+            param.set_value(base_val); solve_attempt(); return low - base_val
         else:
-            low, high = base, base
             while True:
-                high = base - step
-                if high < phys_low:
-                    high = phys_low; param[j] = high
-                    if not solve_attempt() or not basis_unchanged('rhs'): break
-                    else: param[j] = base; solve_attempt(); return base - high
-                param[j] = high
-                if not solve_attempt() or not basis_unchanged('rhs'): break
+                high = base_val - step
+                if high < physical_limit:
+                    high = physical_limit
+                    param.set_value(high)
+                    if not solve_attempt() or not basis_unchanged(): break
+                    param.set_value(base_val); solve_attempt(); return base_val - high
+                param.set_value(high)
+                if not solve_attempt() or not basis_unchanged(): break
                 low = high; step *= 2
-            while low - high > TOL:
-                mid = (low + high) / 2; param[j] = mid
-                if solve_attempt() and basis_unchanged('rhs'): low = mid
+            while low - high > max(0.01, abs(low)*1e-4):
+                mid = (low + high) / 2
+                param.set_value(mid)
+                if solve_attempt() and basis_unchanged(): low = mid
                 else: high = mid
-            param[j] = base; solve_attempt(); return base - low
+            param.set_value(base_val); solve_attempt(); return base_val - low
 
+    # 5. 计算原料灵敏度
     result_recipe = []
     for i, ing in enumerate(ingredients):
-        qty = pyo.value(model.x[ing]) * 100
-        inc = price_range(i, 'increase')
-        dec = price_range(i, 'decrease')
+        qty = x_base[ing] * 100
+        
+        # 【微调】：限制价格搜索范围为当前价格的 10% ~ 10 倍
+        min_p_limit = max(0.0, price_base[i] * 0.1)
+        max_p_limit = price_base[i] * 10.0
+        
+        p_inc = binary_search_bound(model.price[ing], price_base[i], max_p_limit, 'increase')
+        p_dec = binary_search_bound(model.price[ing], price_base[i], min_p_limit, 'decrease')
+        
+        ing_inc_lb = binary_search_bound(model.lb_ing[ing], lb_ing_base[i], 1.0, 'increase')
+        ing_dec_lb = binary_search_bound(model.lb_ing[ing], lb_ing_base[i], 0.0, 'decrease')
+        ing_inc_ub = binary_search_bound(model.ub_ing[ing], ub_ing_base[i], 1.0, 'increase')
+        ing_dec_ub = binary_search_bound(model.ub_ing[ing], ub_ing_base[i], 0.0, 'decrease')
+
         result_recipe.append({
-            "原料名称": str(ing),
-            "结果%": round(float(qty), 4),
-            "递减成本": round(float(rc_base[i] or 0.0), 4),
+            "原料名称": ing,
+            "结果%": round(qty, 4),
+            "递减成本": round(rc_base[ing], 4),
             "当前价格": float(price_base[i]),
-            "价格下限": round(float(price_base[i] - dec), 2),
-            "价格上限": round(float(price_base[i] + inc), 2)
+            "价格下限": round(float(price_base[i] - p_dec), 2),
+            "价格上限": round(float(price_base[i] + p_inc), 2),
+            "下限影子价格": round(float(dual_ing_lb[ing]), 4),
+            "上限影子价格": round(float(dual_ing_ub[ing]), 4),
+            "下限允许增加": round(float(ing_inc_lb * 100), 2),
+            "下限允许减少": round(float(ing_dec_lb * 100), 2),
+            "上限允许增加": round(float(ing_inc_ub * 100), 2),
+            "上限允许减少": round(float(ing_dec_ub * 100), 2)
         })
 
+    # 6. 计算营养素灵敏度
     result_nutrients = []
     for j, nut in enumerate(nutrient_names):
-        actual = sum(content[i, j] * pyo.value(model.x[ingredients[i]]) for i in range(n_ing))
+        actual = sum(content[ingredients.index(i), nutrient_names.index(nut)] * x_base[i] for i in ingredients)
         
-        inc_lb = nutrient_range(j, 'lb', 'increase') if pd.notna(lb_nut_base[j]) else 0
-        dec_lb = nutrient_range(j, 'lb', 'decrease') if pd.notna(lb_nut_base[j]) else 0
-        inc_ub = nutrient_range(j, 'ub', 'increase') if pd.notna(ub_nut_base[j]) else 0
-        dec_ub = nutrient_range(j, 'ub', 'decrease') if pd.notna(ub_nut_base[j]) else 0
+        n_inc_lb = binary_search_bound(model.lb_nut[nut], lb_nut_base[j], 10000.0, 'increase') 
+        n_dec_lb = binary_search_bound(model.lb_nut[nut], lb_nut_base[j], 0.0, 'decrease')
+        n_inc_ub = binary_search_bound(model.ub_nut[nut], ub_nut_base[j], 10000.0, 'increase')
+        n_dec_ub = binary_search_bound(model.ub_nut[nut], ub_nut_base[j], 0.0, 'decrease')
         
         result_nutrients.append({
-            "营养素": str(nut),
+            "营养素": nut,
             "结果": round(float(actual), 4),
-            "下限": float(lb_nut_base[j]) if pd.notna(lb_nut_base[j]) else 0.0,
-            "上限": float(ub_nut_base[j]) if pd.notna(ub_nut_base[j]) else 999.0,
-            "状态": "达标" if (lb_nut_base[j] - 0.001) <= actual <= (ub_nut_base[j] + 0.001) else "不达标",
-            "下界影子价格": round(float(dual_lb_base[j] or 0.0), 4),
-            "下界允许增加": round(float(inc_lb), 2),
-            "下界允许减少": round(float(dec_lb), 2),
-            "上界影子价格": round(float(dual_ub_base[j] or 0.0), 4),
-            "上界允许增加": round(float(inc_ub), 2),
-            "上界允许减少": round(float(dec_ub), 2)
+            "下限": float(lb_nut_base[j]),
+            "上限": float(ub_nut_base[j]),
+            "状态": "达标" if (lb_nut_base[j] - 1e-4) <= actual <= (ub_nut_base[j] + 1e-4) else "不达标",
+            "下界影子价格": round(float(dual_nut_lb[nut]), 4),
+            "下界允许增加": round(float(n_inc_lb), 2),
+            "下界允许减少": round(float(n_dec_lb), 2),
+            "上界影子价格": round(float(dual_nut_ub[nut]), 4),
+            "上界允许增加": round(float(n_inc_ub), 2),
+            "上界允许减少": round(float(n_dec_ub), 2)
         })
 
     return {
@@ -297,13 +266,13 @@ def solve_formula(req: SolveRequest):
     except Exception as e:
         return {"status": "error", "message": f"计算出错: {str(e)}"}
 
-# ================== 4. 导出 Excel ==================
+# ================== Excel 导出 ==================
 def beautify_excel(writer, sheet_name, df, start_row=0):
     worksheet = writer.sheets[sheet_name]
     for col_idx, col in enumerate(df.columns, start=1):
         max_len = max(df[col].astype(str).map(len).max(), len(str(col))) + 2
         col_letter = chr(64 + col_idx) if col_idx <= 26 else "A" + chr(64 + col_idx - 26)
-        worksheet.column_dimensions[col_letter].width = max_len
+        worksheet.column_dimensions[col_letter].width = max(max_len, 10)
         header_font = Font(bold=True, color="FFFFFF")
         header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
         center_align = Alignment(horizontal="center", vertical="center")
@@ -322,22 +291,26 @@ def export_excel(req: SolveRequest):
 
     excel_buffer = io.BytesIO()
     with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-        sheet_name = "配方与成本"
         df_summary = pd.DataFrame({'项目': ['最优总成本'], '数值': [result['total_cost']], '单位': ['元/吨']})
         df_recipe = pd.DataFrame(result['recipe'])
-        df_summary.to_excel(writer, sheet_name=sheet_name, index=False, startrow=0)
-        df_recipe.to_excel(writer, sheet_name=sheet_name, index=False, startrow=3)
-        beautify_excel(writer, sheet_name, df_summary, 0)
-        beautify_excel(writer, sheet_name, df_recipe, 3)
+        df_recipe_export = df_recipe[['原料名称', '结果%', '当前价格', '价格下限', '价格上限']]
+        df_summary.to_excel(writer, sheet_name="配方与成本", index=False, startrow=0)
+        df_recipe_export.to_excel(writer, sheet_name="配方与成本", index=False, startrow=3)
+        beautify_excel(writer, "配方与成本", df_summary, 0)
+        beautify_excel(writer, "配方与成本", df_recipe_export, 3)
 
         df_nut = pd.DataFrame(result['nutrients'])
         df_nut_export = df_nut[['营养素', '结果', '下限', '上限', '状态', '下界影子价格', '上界影子价格']]
         df_nut_export.to_excel(writer, sheet_name="营养分析", index=False)
         beautify_excel(writer, "营养分析", df_nut_export)
 
-        df_sens = df_nut[['营养素', '下界允许增加', '下界允许减少', '上界允许增加', '上界允许减少']]
-        df_sens.to_excel(writer, sheet_name="灵敏度边界", index=False)
-        beautify_excel(writer, "灵敏度边界", df_sens)
+        df_sens_nut = df_nut[['营养素', '下界允许增加', '下界允许减少', '上界允许增加', '上界允许减少']]
+        df_sens_nut.to_excel(writer, sheet_name="营养灵敏度", index=False)
+        beautify_excel(writer, "营养灵敏度", df_sens_nut)
+
+        df_sens_ing = df_recipe[['原料名称', '下限影子价格', '下限允许增加', '下限允许减少', '上限影子价格', '上限允许增加', '上限允许减少']]
+        df_sens_ing.to_excel(writer, sheet_name="原料灵敏度", index=False)
+        beautify_excel(writer, "原料灵敏度", df_sens_ing)
 
     excel_buffer.seek(0)
     return Response(
