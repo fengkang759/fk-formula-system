@@ -124,15 +124,19 @@
                 <thead>
                     <tr>
                         <th rowspan="2" style="border-right:2px solid #e2e8f0;">原料名称</th>
-                        <th rowspan="2">递减成本</th>
+                        <th rowspan="2">递减成本<br><span style="font-size:10px;font-weight:normal;">(元/吨/1%)</span></th>
                         <th rowspan="2">当前价格</th>
                         <th rowspan="2" style="border-right:2px solid #e2e8f0;">价格变动范围(¥)</th>
                         <th colspan="3" style="background:#eff6ff; border-right:1px solid #e2e8f0;">下限约束(%)</th>
                         <th colspan="3" style="background:#fef2f2;">上限约束(%)</th>
                     </tr>
                     <tr>
-                        <th>影子价格</th><th>允许增加</th><th>允许减少</th>
-                        <th>影子价格</th><th>允许增加</th><th>允许减少</th>
+                        <th>影子价格<br><span style="font-size:10px;font-weight:normal;">(元/吨/1%)</span></th>
+                        <th>允许增加</th>
+                        <th>允许减少</th>
+                        <th>影子价格<br><span style="font-size:10px;font-weight:normal;">(元/吨/1%)</span></th>
+                        <th>允许增加</th>
+                        <th>允许减少</th>
                     </tr>
                 </thead>
                 <tbody></tbody>
@@ -149,8 +153,12 @@
                         <th colspan="3" style="background:#fef2f2;">上界 (Max)</th>
                     </tr>
                     <tr>
-                        <th>影子价格</th><th>允许增加</th><th>允许减少</th>
-                        <th>影子价格</th><th>允许增加</th><th>允许减少</th>
+                        <th>影子价格<br><span style="font-size:10px;font-weight:normal;">(元/吨/1单位)</span></th>
+                        <th>允许增加</th>
+                        <th>允许减少</th>
+                        <th>影子价格<br><span style="font-size:10px;font-weight:normal;">(元/吨/1单位)</span></th>
+                        <th>允许增加</th>
+                        <th>允许减少</th>
                     </tr>
                 </thead>
                 <tbody></tbody>
@@ -289,8 +297,12 @@
                         const idx = ingredients.findIndex(i => i.name === item['原料名称']);
                         if (idx !== -1) {
                             const el = document.getElementById(`res-ing-${idx}`);
-                            el.innerText = item['结果%'].toFixed(2) + "%";
-                            el.className = item['结果%'] > 0 ? "text-green" : "text-gray";
+                            el.innerText = item['结果%'].toFixed(4) + "%";
+                            if (item['是否固定']) {
+                                el.className = "text-blue";
+                            } else {
+                                el.className = item['结果%'] > 0 ? "text-green" : "text-gray";
+                            }
                         }
                     });
                     data.nutrients.forEach(item => {
@@ -310,28 +322,40 @@
         }
 
         function getShadowPriceClass(val) {
+            if (val === null || val === '-' || val === undefined) return 'text-gray';
             if (val > 0) return 'text-red';
             if (val < 0) return 'text-green';
             return 'text-gray';
         }
 
         function renderSensitivityTables(recipeData, nutrientData) {
-            document.querySelector("#priceRangeTable tbody").innerHTML = recipeData.map(r => `
+            document.querySelector("#priceRangeTable tbody").innerHTML = recipeData.map(r => {
+                const isFixed = r['是否固定'];
+                const rcStr = isFixed ? '-' : r['递减成本'];
+                const rcCls = isFixed ? 'text-gray' : (r['递减成本'] < 0 ? 'text-red' : (r['递减成本'] > 0 ? 'text-green' : 'text-gray'));
+                
+                const pMin = r['价格下限'];
+                const pMax = r['价格上限'];
+
+                const lbShadow = isFixed ? '-' : r['下限影子价格'];
+                const ubShadow = isFixed ? '-' : r['上限影子价格'];
+
+                return `
                 <tr>
                     <td style="text-align:left; font-weight:500; border-right:2px solid #e2e8f0;">${r['原料名称']}</td>
-                    <td class="${r['递减成本'] < 0 ? 'text-red' : (r['递减成本'] > 0 ? 'text-green' : 'text-gray')}">${r['递减成本']}</td>
+                    <td class="${rcCls}">${rcStr}</td>
                     <td class="text-gray">${r['当前价格']}</td>
-                    <td class="text-blue" style="border-right:2px solid #e2e8f0;">${r['价格下限']} ~ ${r['价格上限']}</td>
+                    <td class="text-blue" style="border-right:2px solid #e2e8f0;">${pMin} ~ ${pMax}</td>
                     
-                    <td class="${getShadowPriceClass(r['下限影子价格'])}">${r['下限影子价格']}</td>
+                    <td class="${getShadowPriceClass(r['下限影子价格'])}">${lbShadow}</td>
                     <td class="text-gray">${r['下限允许增加']}</td>
                     <td class="text-gray" style="border-right:1px solid #e2e8f0;">${r['下限允许减少']}</td>
                     
-                    <td class="${getShadowPriceClass(r['上限影子价格'])}">${r['上限影子价格']}</td>
+                    <td class="${getShadowPriceClass(r['上限影子价格'])}">${ubShadow}</td>
                     <td class="text-gray">${r['上限允许增加']}</td>
                     <td class="text-gray">${r['上限允许减少']}</td>
                 </tr>
-            `).join('');
+            `}).join('');
 
             document.querySelector("#rhsRangeTable tbody").innerHTML = nutrientData.map(n => `
                 <tr>
