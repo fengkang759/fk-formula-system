@@ -18,13 +18,13 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # 生产环境请按域名收紧
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-MAX_BOUND = 1e5                   # 灵敏度搜索用的大边界
-MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10MB
+MAX_BOUND = 1e5
+MAX_UPLOAD_SIZE = 10 * 1024 * 1024
 VALID_RECIPE_RE = re.compile(r'^[\w\u4e00-\u9fa5\-]+$')
 
 
@@ -74,6 +74,7 @@ def read_csv_with_fallback(content_bytes):
 
 
 def get_solver():
+    # 优先使用传统 highs，它对 load_solutions 的兼容性更好
     for name in ('highs', 'appsi_highs', 'glpk'):
         try:
             s = SolverFactory(name)
@@ -281,12 +282,9 @@ def run_lp(ing_data, req_data):
             "message": "未找到可用的求解器。请安装 highspy：pip install highspy",
         }
 
-    # 构建 Pyomo 模型
+    # 构建模型
     model = pyo.ConcreteModel()
-    
-    # 【修复】移除 bounds=(0,1)，防止约束冲突导致模型退化
-    model.x = pyo.Var(ingredients) 
-    
+    model.x = pyo.Var(ingredients)
     model.price = pyo.Param(ingredients, initialize=lambda m, i: float(price_base[ing_idx[i]]), mutable=True)
     model.lb_ing = pyo.Param(ingredients, initialize=lambda m, i: float(lb_ing_base[ing_idx[i]]), mutable=True)
     model.ub_ing = pyo.Param(ingredients, initialize=lambda m, i: float(ub_ing_base[ing_idx[i]]), mutable=True)
@@ -308,24 +306,55 @@ def run_lp(ing_data, req_data):
     model.cost = pyo.Objective(expr=sum(model.price[i] * model.x[i] for i in ingredients), sense=pyo.minimize)
     model.dual = Suffix(direction=Suffix.IMPORT)
 
-    try:
-        res = solver.solve(model, tee=False, load_solutions=True)
-    except Exception as e:
-        return {"status": "error", "message": f"求解器异常: {str(e)}"}
+    def solve_attempt():
+        try:
+            # 清理旧后缀，避免求解器未刷新对偶值时读到陈旧数据
+            try:
+                for k in list(model.dual.keys()):
+                    del model.dual[k]
+            except Exception:
+                pass
+            
+            # 【核心修复】统一使用 load_solutions=False 避免无解时抛出异常导致日志刷屏
+            if hasattr(solver, 'config') and hasattr(solver.config, 'load_solutions'):
+                solver.config.load_solutions = False
+                r = solver.solve(model)
+                term = str(r.termination_condition)
+                if 'optimal' in term.lower():
+                    solver.load_vars()
+                    return True
+            else:
+                r = solver.solve(model, tee=False, load_solutions=False)
+                term = str(r.solver.termination_condition)
+                if 'optimal' in term.lower():
+                    model.solutions.load_from(r)
+                    return True
+            return False
+        except Exception:
+            # 在二分查找探测边界时，无解是正常现象，直接静默返回 False
+            return False
 
-    if (res.solver.status != pyo.SolverStatus.ok or
-            res.solver.termination_condition != pyo.TerminationCondition.optimal):
+    if not solve_attempt():
         return {
             "status": "error",
-            "message": f"无最优解（状态: {res.solver.termination_condition}）。请检查营养指标或原料限制是否矛盾。",
+            "message": "无最优解。请检查营养指标或原料限制是否矛盾。",
         }
 
     cost_base = pyo.value(model.cost)
     x_base = {i: pyo.value(model.x[i]) for i in ingredients}
 
     def safe_dual(constraint_obj):
-        v = model.dual.get(constraint_obj, 0.0)
-        return 0.0 if v is None else float(v)
+        try:
+            # 尝试从 model.dual 后缀获取（传统 highs）
+            v = model.dual.get(constraint_obj, 0.0)
+            if v is not None and abs(v) > 1e-9:
+                return float(v)
+            # 如果为0，尝试从 constraint 对象直接获取（appsi_highs）
+            if getattr(constraint_obj, 'dual', None) is not None:
+                return float(constraint_obj.dual)
+            return float(v) if v is not None else 0.0
+        except Exception:
+            return 0.0
 
     dual_ing_lb = {i: safe_dual(model.c_ing_lb[i]) for i in ingredients}
     dual_ing_ub = {i: safe_dual(model.c_ing_ub[i]) for i in ingredients}
@@ -348,23 +377,26 @@ def run_lp(ing_data, req_data):
             else:
                 rc_base[i] = 0.0
 
-    def solve_attempt():
-        try:
-            r = solver.solve(model, tee=False, load_solutions=True)
-            return (r.solver.status == pyo.SolverStatus.ok and
-                    r.termination_condition == pyo.TerminationCondition.optimal)
-        except Exception:
-            return False
-
-    # 【修复】放宽容差，防止浮点波动被误判为基改变
+    # ===== 修复要点 1：basis_unchanged 容差放宽（5% 相对 / 1e-3 绝对）=====
     def basis_unchanged():
-        return all(abs(pyo.value(model.x[i]) - x_base[i]) <= 1e-3 for i in ingredients)
+        for i in ingredients:
+            bv = x_base[i]
+            cv = pyo.value(model.x[i])
+            tol = max(1e-3, abs(bv) * 0.05)
+            if abs(cv - bv) > tol:
+                return False
+        return True
 
+    # ===== 修复要点 2：dual 判据容差放宽（5% 相对 / 0.1 绝对）=====
     def make_dual_check(constraint_obj, base_dual):
-        return lambda: abs(safe_dual(constraint_obj) - base_dual) <= max(1e-3, abs(base_dual) * 1e-3)
+        def check():
+            v = safe_dual(constraint_obj)
+            if abs(base_dual) < 1e-4:
+                return abs(v) < 0.1
+            return abs(v - base_dual) <= max(0.1, abs(base_dual) * 0.05)
+        return check
 
     def binary_search_bound(param, base_val, lower_limit, upper_limit, direction, check_func):
-        # 【修复】缩小初始步长，便于精准命中临界点
         step = max(abs(base_val) * 0.01, 0.01)
 
         def restore():
@@ -454,13 +486,14 @@ def run_lp(ing_data, req_data):
             return "-"
         if v is None:
             return "∞"
-        return round(float(v) * 100, 2)
+        return round(float(v) * 100, 4)
 
     def _fmt_raw(v):
         if v is None:
             return "∞"
-        return round(float(v), 2)
+        return round(float(v), 4)
 
+    # ===================== 原料灵敏度 =====================
     result_recipe = []
     for i, ing in enumerate(ingredients):
         idx = ing_idx[ing]
@@ -506,6 +539,7 @@ def run_lp(ing_data, req_data):
             "上限允许减少": _fmt_pct(ing_dec_ub, is_fixed[ing]),
         })
 
+    # ===================== 营养灵敏度 =====================
     result_nutrients = []
     x_vec = np.array([x_base[i] for i in ingredients])
 
