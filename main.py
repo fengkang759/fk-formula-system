@@ -74,8 +74,8 @@ def read_csv_with_fallback(content_bytes):
 
 
 def get_solver():
-    # 优先使用传统 highs，它对 load_solutions 的兼容性更好
-    for name in ('highs', 'appsi_highs', 'glpk'):
+    # 必须使用传统 highs，因为 appsi_highs 不支持可变参数在二分查找中的反复更新
+    for name in ('highs', 'glpk'):
         try:
             s = SolverFactory(name)
             if s.available(exception_flag=False):
@@ -308,27 +308,23 @@ def run_lp(ing_data, req_data):
 
     def solve_attempt():
         try:
-            # 清理旧后缀，避免求解器未刷新对偶值时读到陈旧数据
+            # 清理旧后缀，避免读取到陈旧数据
             try:
                 for k in list(model.dual.keys()):
                     del model.dual[k]
             except Exception:
                 pass
+                
+            # 强制不加载解，防止无解时抛出异常导致日志刷屏
+            r = solver.solve(model, tee=False, load_solutions=False)
             
-            # 【核心修复】统一使用 load_solutions=False 避免无解时抛出异常导致日志刷屏
-            if hasattr(solver, 'config') and hasattr(solver.config, 'load_solutions'):
-                solver.config.load_solutions = False
-                r = solver.solve(model)
-                term = str(r.termination_condition)
-                if 'optimal' in term.lower():
-                    solver.load_vars()
-                    return True
-            else:
-                r = solver.solve(model, tee=False, load_solutions=False)
-                term = str(r.solver.termination_condition)
-                if 'optimal' in term.lower():
-                    model.solutions.load_from(r)
-                    return True
+            # 传统接口的状态检查
+            term = getattr(getattr(r, 'solver', None), 'termination_condition', None)
+            
+            if str(term).lower() == 'optimal':
+                # 只有在最优时才加载解
+                model.solutions.load_from(r)
+                return True
             return False
         except Exception:
             # 在二分查找探测边界时，无解是正常现象，直接静默返回 False
@@ -337,7 +333,7 @@ def run_lp(ing_data, req_data):
     if not solve_attempt():
         return {
             "status": "error",
-            "message": "无最优解。请检查营养指标或原料限制是否矛盾。",
+            "message": "无最优解。请检查营养指标或原料限制是否矛盾。\n(提示：通常是某项营养素下限设得过高，或者某项原料用量上限设得过低导致)",
         }
 
     cost_base = pyo.value(model.cost)
@@ -345,13 +341,8 @@ def run_lp(ing_data, req_data):
 
     def safe_dual(constraint_obj):
         try:
-            # 尝试从 model.dual 后缀获取（传统 highs）
+            # 传统 highs 会写入 model.dual 后缀
             v = model.dual.get(constraint_obj, 0.0)
-            if v is not None and abs(v) > 1e-9:
-                return float(v)
-            # 如果为0，尝试从 constraint 对象直接获取（appsi_highs）
-            if getattr(constraint_obj, 'dual', None) is not None:
-                return float(constraint_obj.dual)
             return float(v) if v is not None else 0.0
         except Exception:
             return 0.0
@@ -377,7 +368,7 @@ def run_lp(ing_data, req_data):
             else:
                 rc_base[i] = 0.0
 
-    # ===== 修复要点 1：basis_unchanged 容差放宽（5% 相对 / 1e-3 绝对）=====
+    # 灵敏度分析容差放宽
     def basis_unchanged():
         for i in ingredients:
             bv = x_base[i]
@@ -387,7 +378,6 @@ def run_lp(ing_data, req_data):
                 return False
         return True
 
-    # ===== 修复要点 2：dual 判据容差放宽（5% 相对 / 0.1 绝对）=====
     def make_dual_check(constraint_obj, base_dual):
         def check():
             v = safe_dual(constraint_obj)
