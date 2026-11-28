@@ -4,9 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 import numpy as np
-import pyomo.environ as pyo
-from pyomo.opt import SolverFactory
-from pyomo.core import Suffix
+import highspy
 import os
 import glob
 import io
@@ -23,9 +21,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MAX_BOUND = 1e5
 MAX_UPLOAD_SIZE = 10 * 1024 * 1024
 VALID_RECIPE_RE = re.compile(r'^[\w\u4e00-\u9fa5\-]+$')
+INF = highspy.kHighsInf
 
 
 class SolveRequest(BaseModel):
@@ -71,18 +69,6 @@ def read_csv_with_fallback(content_bytes):
             last_err = e
             continue
     raise ValueError(f"无法解析 CSV 文件。错误：{last_err}")
-
-
-def get_solver():
-    # 必须使用传统 highs，因为 appsi_highs 不支持可变参数在二分查找中的反复更新
-    for name in ('highs', 'glpk'):
-        try:
-            s = SolverFactory(name)
-            if s.available(exception_flag=False):
-                return s, name
-        except Exception:
-            continue
-    return None, None
 
 
 def _beautify_header(writer, sheet_name, df, start_row=0):
@@ -241,7 +227,7 @@ def validate_inputs(df_ing, df_req, nutrient_names):
     return errors
 
 
-# ================== 核心求解与灵敏度分析 ==================
+# ================== 核心求解（highspy 矩阵接口 + getRanging） ==================
 def run_lp(ing_data, req_data):
     try:
         df_ing = pd.DataFrame(ing_data)
@@ -258,316 +244,266 @@ def run_lp(ing_data, req_data):
         return {"status": "error", "message": "数据校验失败：\n" + "\n".join(errs)}
 
     ingredients = [str(n) for n in df_ing['原料名称'].tolist()]
-    ing_idx = {n: i for i, n in enumerate(ingredients)}
-    nut_idx = {n: j for j, n in enumerate(nutrient_names)}
+    n = len(ingredients)
+    m = len(nutrient_names)
+    ing_idx = {name: i for i, name in enumerate(ingredients)}
+    nut_idx = {name: j for j, name in enumerate(nutrient_names)}
 
-    price_base = np.array([parse_numeric(v, 0) for v in df_ing['价格']])
-    lb_ing_base = np.array([parse_numeric(v, 0) for v in df_ing['用量下限%']]) / 100.0
-    ub_ing_base = np.array([parse_numeric(v, 100) for v in df_ing['用量上限%']]) / 100.0
+    price_base = np.array([parse_numeric(v, 0) for v in df_ing['价格']], dtype=np.double)
+    lb_ing = np.array([parse_numeric(v, 0) for v in df_ing['用量下限%']], dtype=np.double) / 100.0
+    ub_ing = np.array([parse_numeric(v, 100) for v in df_ing['用量上限%']], dtype=np.double) / 100.0
 
-    lb_nut_base = np.array([parse_numeric(v, 0) for v in df_req['下限']])
-    ub_nut_base = np.array([parse_numeric(v, 1e9) for v in df_req['上限']])
+    lb_nut = np.array([parse_numeric(v, 0) for v in df_req['下限']], dtype=np.double)
+    ub_nut = np.array([parse_numeric(v, 1e9) for v in df_req['上限']], dtype=np.double)
 
-    content = np.zeros((len(ingredients), len(nutrient_names)))
+    content = np.zeros((n, m), dtype=np.double)
     for j, nut in enumerate(nutrient_names):
         if nut in df_ing.columns:
             col = df_ing[nut].tolist()
-            for i in range(len(ingredients)):
+            for i in range(n):
                 content[i, j] = parse_numeric(col[i], 0)
 
-    solver, solver_name = get_solver()
-    if solver is None:
+    # 固定变量判断
+    is_fixed = np.abs(ub_ing - lb_ing) < 1e-5
+
+    # ---------- 构建 highspy 模型 ----------
+    h = highspy.Highs()
+    h.setOptionValue("output_flag", False)
+
+    h.addCols(n, price_base, lb_ing, ub_ing, 0, 0, 0, 0)
+
+    # 营养下限行
+    for j in range(m):
+        idx = []
+        val = []
+        for i in range(n):
+            if content[i, j] != 0.0:
+                idx.append(i)
+                val.append(content[i, j])
+        h.addRow(lb_nut[j], INF, len(idx), np.array(idx, dtype=np.int32), np.array(val, dtype=np.double))
+
+    # 营养上限行
+    for j in range(m):
+        idx = []
+        val = []
+        for i in range(n):
+            if content[i, j] != 0.0:
+                idx.append(i)
+                val.append(content[i, j])
+        h.addRow(-INF, ub_nut[j], len(idx), np.array(idx, dtype=np.int32), np.array(val, dtype=np.double))
+
+    # 总用量 = 1
+    all_idx = list(range(n))
+    all_val = [1.0] * n
+    h.addRow(1.0, 1.0, n, np.array(all_idx, dtype=np.int32), np.array(all_val, dtype=np.double))
+
+    # ---------- 求解 ----------
+    h.run()
+    status = h.getModelStatus()
+    if status != highspy.HighsModelStatus.kOptimal:
         return {
             "status": "error",
-            "message": "未找到可用的求解器。请安装 highspy：pip install highspy",
+            "message": "无最优解。请检查营养指标或原料限制是否矛盾。\n"
+                       "(提示：通常是某项营养素下限设得过高，或者某项原料用量上限设得过低导致)",
         }
 
-    # 构建模型
-    model = pyo.ConcreteModel()
-    model.x = pyo.Var(ingredients)
-    model.price = pyo.Param(ingredients, initialize=lambda m, i: float(price_base[ing_idx[i]]), mutable=True)
-    model.lb_ing = pyo.Param(ingredients, initialize=lambda m, i: float(lb_ing_base[ing_idx[i]]), mutable=True)
-    model.ub_ing = pyo.Param(ingredients, initialize=lambda m, i: float(ub_ing_base[ing_idx[i]]), mutable=True)
-    model.lb_nut = pyo.Param(nutrient_names, initialize=lambda m, j: float(lb_nut_base[nut_idx[j]]), mutable=True)
-    model.ub_nut = pyo.Param(nutrient_names, initialize=lambda m, j: float(ub_nut_base[nut_idx[j]]), mutable=True)
+    solution = h.getSolution()
+    info = h.getInfo()
 
-    model.c_ing_lb = pyo.Constraint(ingredients, rule=lambda m, i: m.x[i] >= m.lb_ing[i])
-    model.c_ing_ub = pyo.Constraint(ingredients, rule=lambda m, i: m.x[i] <= m.ub_ing[i])
+    x_val = np.array(solution.col_value, dtype=np.double)
+    row_dual = np.array(solution.row_dual, dtype=np.double)
+    col_dual = np.array(solution.col_dual, dtype=np.double)
 
-    def nut_rule_lb(m, j):
-        return sum(content[ing_idx[i], nut_idx[j]] * m.x[i] for i in ingredients) >= m.lb_nut[j]
+    cost_base = float(info.objective_function_value)
 
-    def nut_rule_ub(m, j):
-        return sum(content[ing_idx[i], nut_idx[j]] * m.x[i] for i in ingredients) <= m.ub_nut[j]
+    status_r, ranging = h.getRanging()
+    if status_r != highspy.HighsStatus.kOk:
+        return {"status": "error", "message": "灵敏度分析获取失败（getRanging 返回非 Ok）"}
 
-    model.c_nut_lb = pyo.Constraint(nutrient_names, rule=nut_rule_lb)
-    model.c_nut_ub = pyo.Constraint(nutrient_names, rule=nut_rule_ub)
-    model.c_total = pyo.Constraint(expr=sum(model.x[i] for i in ingredients) == 1)
-    model.cost = pyo.Objective(expr=sum(model.price[i] * model.x[i] for i in ingredients), sense=pyo.minimize)
-    model.dual = Suffix(direction=Suffix.IMPORT)
-
-    def solve_attempt():
+    # ---------- 格式化与安全读取辅助 ----------
+    def safe_idx(arr, idx, default=0.0):
         try:
-            # 清理旧后缀，避免读取到陈旧数据
-            try:
-                for k in list(model.dual.keys()):
-                    del model.dual[k]
-            except Exception:
-                pass
-                
-            # 强制不加载解，防止无解时抛出异常导致日志刷屏
-            r = solver.solve(model, tee=False, load_solutions=False)
-            
-            # 传统接口的状态检查
-            term = getattr(getattr(r, 'solver', None), 'termination_condition', None)
-            
-            if str(term).lower() == 'optimal':
-                # 只有在最优时才加载解
-                model.solutions.load_from(r)
-                return True
-            return False
+            if idx < len(arr):
+                return arr[idx]
         except Exception:
-            # 在二分查找探测边界时，无解是正常现象，直接静默返回 False
-            return False
+            pass
+        return default
 
-    if not solve_attempt():
-        return {
-            "status": "error",
-            "message": "无最优解。请检查营养指标或原料限制是否矛盾。\n(提示：通常是某项营养素下限设得过高，或者某项原料用量上限设得过低导致)",
-        }
-
-    cost_base = pyo.value(model.cost)
-    x_base = {i: pyo.value(model.x[i]) for i in ingredients}
-
-    def safe_dual(constraint_obj):
-        try:
-            # 传统 highs 会写入 model.dual 后缀
-            v = model.dual.get(constraint_obj, 0.0)
-            return float(v) if v is not None else 0.0
-        except Exception:
-            return 0.0
-
-    dual_ing_lb = {i: safe_dual(model.c_ing_lb[i]) for i in ingredients}
-    dual_ing_ub = {i: safe_dual(model.c_ing_ub[i]) for i in ingredients}
-    dual_nut_lb = {j: safe_dual(model.c_nut_lb[j]) for j in nutrient_names}
-    dual_nut_ub = {j: safe_dual(model.c_nut_ub[j]) for j in nutrient_names}
-
-    rc_base = {}
-    is_fixed = {}
-    for i in ingredients:
-        idx = ing_idx[i]
-        if abs(ub_ing_base[idx] - lb_ing_base[idx]) < 1e-5:
-            is_fixed[i] = True
-            rc_base[i] = 0.0
-        else:
-            is_fixed[i] = False
-            if abs(x_base[i] - lb_ing_base[idx]) < 1e-5:
-                rc_base[i] = dual_ing_lb[i]
-            elif abs(x_base[i] - ub_ing_base[idx]) < 1e-5:
-                rc_base[i] = dual_ing_ub[i]
-            else:
-                rc_base[i] = 0.0
-
-    # 灵敏度分析容差放宽
-    def basis_unchanged():
-        for i in ingredients:
-            bv = x_base[i]
-            cv = pyo.value(model.x[i])
-            tol = max(1e-3, abs(bv) * 0.05)
-            if abs(cv - bv) > tol:
-                return False
-        return True
-
-    def make_dual_check(constraint_obj, base_dual):
-        def check():
-            v = safe_dual(constraint_obj)
-            if abs(base_dual) < 1e-4:
-                return abs(v) < 0.1
-            return abs(v - base_dual) <= max(0.1, abs(base_dual) * 0.05)
-        return check
-
-    def binary_search_bound(param, base_val, lower_limit, upper_limit, direction, check_func):
-        step = max(abs(base_val) * 0.01, 0.01)
-
-        def restore():
-            param.set_value(base_val)
-            solve_attempt()
-
-        if direction == 'increase':
-            feasible, infeasible = base_val, None
-            guard = 0
-            while guard < 200:
-                guard += 1
-                trial = base_val + step
-                if trial >= upper_limit:
-                    trial = upper_limit
-                    param.set_value(trial)
-                    ok = solve_attempt() and check_func()
-                    if not ok:
-                        infeasible = trial
-                        break
-                    restore()
-                    if upper_limit < MAX_BOUND:
-                        return trial - base_val
-                    return None
-                param.set_value(trial)
-                if not solve_attempt() or not check_func():
-                    infeasible = trial
-                    break
-                feasible = trial
-                step *= 2
-
-            if infeasible is None or infeasible <= feasible + 1e-10:
-                restore()
-                return 0.0
-
-            guard = 0
-            while infeasible - feasible > max(0.0001, abs(infeasible) * 1e-5) and guard < 100:
-                guard += 1
-                mid = (feasible + infeasible) / 2
-                param.set_value(mid)
-                if solve_attempt() and check_func():
-                    feasible = mid
-                else:
-                    infeasible = mid
-            restore()
-            return feasible - base_val
-
-        else:  # decrease
-            feasible, infeasible = base_val, None
-            guard = 0
-            while guard < 200:
-                guard += 1
-                trial = base_val - step
-                if trial <= lower_limit:
-                    trial = lower_limit
-                    param.set_value(trial)
-                    ok = solve_attempt() and check_func()
-                    if not ok:
-                        infeasible = trial
-                        break
-                    restore()
-                    return base_val - trial
-                param.set_value(trial)
-                if not solve_attempt() or not check_func():
-                    infeasible = trial
-                    break
-                feasible = trial
-                step *= 2
-
-            if infeasible is None or feasible <= infeasible + 1e-10:
-                restore()
-                return 0.0
-
-            guard = 0
-            while feasible - infeasible > max(0.0001, abs(feasible) * 1e-5) and guard < 100:
-                guard += 1
-                mid = (feasible + infeasible) / 2
-                param.set_value(mid)
-                if solve_attempt() and check_func():
-                    feasible = mid
-                else:
-                    infeasible = mid
-            restore()
-            return base_val - feasible
-
-    def _fmt_pct(v, is_fixed_flag):
-        if is_fixed_flag:
-            return "-"
-        if v is None:
+    def _fmt_pct(v):
+        if v is None or abs(v) >= INF / 2:
             return "∞"
         return round(float(v) * 100, 4)
 
     def _fmt_raw(v):
-        if v is None:
+        if v is None or abs(v) >= INF / 2:
             return "∞"
         return round(float(v), 4)
 
-    # ===================== 原料灵敏度 =====================
+    # 【优化】用 -∞ 和 ∞ 表达价格的界限
+    def _price_bound(base, ranged_value, is_lower=True):
+        if abs(ranged_value) >= INF / 2:
+            return "-∞" if is_lower else "∞"
+        return round(float(ranged_value), 2)
+
+    # ===================== 原料结果 + 灵敏度 =====================
     result_recipe = []
     for i, ing in enumerate(ingredients):
-        idx = ing_idx[ing]
-        qty = x_base[ing] * 100
+        qty = float(x_val[i]) * 100.0
+        fixed = bool(is_fixed[i])
 
-        if is_fixed[ing]:
-            ing_inc_lb = ing_dec_lb = ing_inc_ub = ing_dec_ub = 0.0
-            dual_ing_lb_val = dual_ing_ub_val = 0.0
-            price_lower_disp = "-"
-            price_upper_disp = "-"
+        if fixed:
+            result_recipe.append({
+                "原料名称": ing,
+                "是否固定": True,
+                "结果%": round(qty, 4),
+                "递减成本": None,
+                "当前价格": float(price_base[i]),
+                "价格下限": "-",
+                "价格上限": "-",
+                "下限影子价格": None,
+                "上限影子价格": None,
+                "下限允许增加": "-",
+                "下限允许减少": "-",
+                "上限允许增加": "-",
+                "上限允许减少": "-",
+            })
+            continue
+
+        cost_dn_val = safe_idx(ranging.col_cost_dn.value_, i, price_base[i])
+        cost_up_val = safe_idx(ranging.col_cost_up.value_, i, price_base[i])
+        
+        price_lower = _price_bound(price_base[i], cost_dn_val, is_lower=True)
+        price_upper = _price_bound(price_base[i], cost_up_val, is_lower=False)
+
+        lb_dn_val = safe_idx(ranging.col_bound_dn.value_, i, -INF) if lb_ing[i] > -INF / 2 else -INF
+        lb_up_val = safe_idx(ranging.col_bound_up.value_, i, INF) if lb_ing[i] > -INF / 2 else INF
+        ub_dn_val = safe_idx(ranging.col_bound_dn.value_, i, -INF) if ub_ing[i] < INF / 2 else -INF
+        ub_up_val = safe_idx(ranging.col_bound_up.value_, i, INF) if ub_ing[i] < INF / 2 else INF
+
+        if lb_ing[i] <= 1e-9:
+            ing_dec_lb_disp = "0"
+        elif abs(lb_dn_val) >= INF / 2:
+            ing_dec_lb_disp = "∞"
         else:
-            p_inc = binary_search_bound(model.price[ing], price_base[idx], 0, MAX_BOUND, 'increase', basis_unchanged)
-            p_dec = binary_search_bound(model.price[ing], price_base[idx], 0, MAX_BOUND, 'decrease', basis_unchanged)
-            price_lower_disp = "0" if p_dec is None else round(float(price_base[idx] - p_dec), 2)
-            if p_inc is None:
-                price_upper_disp = "∞"
-            else:
-                upper_val = price_base[idx] + p_inc
-                price_upper_disp = "∞" if upper_val >= MAX_BOUND else round(float(upper_val), 2)
+            ing_dec_lb_disp = _fmt_pct(max(0.0, lb_ing[i] - lb_dn_val))
 
-            check_lb = make_dual_check(model.c_ing_lb[ing], dual_ing_lb[ing])
-            check_ub = make_dual_check(model.c_ing_ub[ing], dual_ing_ub[ing])
-            ing_inc_lb = binary_search_bound(model.lb_ing[ing], lb_ing_base[idx], 0, 1.0, 'increase', check_lb)
-            ing_dec_lb = binary_search_bound(model.lb_ing[ing], lb_ing_base[idx], 0, 1.0, 'decrease', check_lb)
-            ing_inc_ub = binary_search_bound(model.ub_ing[ing], ub_ing_base[idx], 0, 1.0, 'increase', check_ub)
-            ing_dec_ub = binary_search_bound(model.ub_ing[ing], ub_ing_base[idx], 0, 1.0, 'decrease', check_ub)
-            dual_ing_lb_val = dual_ing_lb[ing]
-            dual_ing_ub_val = dual_ing_ub[ing]
+        if abs(lb_up_val) >= INF / 2:
+            ing_inc_lb_disp = "∞"
+        else:
+            ing_inc_lb_disp = _fmt_pct(max(0.0, lb_up_val - lb_ing[i]))
+
+        if ub_ing[i] >= 1.0 - 1e-9:
+            ing_inc_ub_disp = "0"
+        elif abs(ub_up_val) >= INF / 2:
+            ing_inc_ub_disp = "∞"
+        else:
+            ing_inc_ub_disp = _fmt_pct(max(0.0, ub_up_val - ub_ing[i]))
+
+        if abs(ub_dn_val) >= INF / 2:
+            ing_dec_ub_disp = "∞"
+        else:
+            ing_dec_ub_disp = _fmt_pct(max(0.0, ub_ing[i] - ub_dn_val))
+
+        col_dual_val = safe_idx(col_dual, i, 0.0)
 
         result_recipe.append({
             "原料名称": ing,
-            "是否固定": is_fixed[ing],
+            "是否固定": False,
             "结果%": round(qty, 4),
-            "递减成本": round(rc_base[ing] / 100, 4) if not is_fixed[ing] else None,
-            "当前价格": float(price_base[idx]),
-            "价格下限": price_lower_disp,
-            "价格上限": price_upper_disp,
-            "下限影子价格": round(float(dual_ing_lb_val) / 100, 4) if not is_fixed[ing] else None,
-            "上限影子价格": round(float(dual_ing_ub_val) / 100, 4) if not is_fixed[ing] else None,
-            "下限允许增加": _fmt_pct(ing_inc_lb, is_fixed[ing]),
-            "下限允许减少": _fmt_pct(ing_dec_lb, is_fixed[ing]),
-            "上限允许增加": _fmt_pct(ing_inc_ub, is_fixed[ing]),
-            "上限允许减少": _fmt_pct(ing_dec_ub, is_fixed[ing]),
+            "递减成本": round(float(col_dual_val) / 100.0, 4),
+            "当前价格": float(price_base[i]),
+            "价格下限": price_lower,
+            "价格上限": price_upper,
+            "下限影子价格": 0.0,
+            "上限影子价格": 0.0,
+            "下限允许增加": ing_inc_lb_disp,
+            "下限允许减少": ing_dec_lb_disp,
+            "上限允许增加": ing_inc_ub_disp,
+            "上限允许减少": ing_dec_ub_disp,
         })
 
-    # ===================== 营养灵敏度 =====================
+    # 修正原料上下限影子价格判断逻辑，增加距离比较，防止由于浮点误差或基退化导致判断错误
+    for entry in result_recipe:
+        if entry["是否固定"]:
+            continue
+        i = ing_idx[entry["原料名称"]]
+        xv = float(x_val[i])
+        cd = float(safe_idx(col_dual, i, 0.0))
+        dist_lb = abs(xv - lb_ing[i])
+        dist_ub = abs(xv - ub_ing[i])
+        
+        if dist_lb < 1e-4 and dist_lb <= dist_ub:
+            entry["下限影子价格"] = round(cd / 100.0, 4)
+            entry["上限影子价格"] = 0.0
+        elif dist_ub < 1e-4:
+            entry["下限影子价格"] = 0.0
+            entry["上限影子价格"] = round(cd / 100.0, 4)
+        else:
+            entry["下限影子价格"] = 0.0
+            entry["上限影子价格"] = 0.0
+
+    # ===================== 营养结果 + 灵敏度 =====================
     result_nutrients = []
-    x_vec = np.array([x_base[i] for i in ingredients])
+    for j, nut in enumerate(nutrient_names):
+        actual = float(np.dot(content[:, j], x_val))
+        lb_row = j
+        ub_row = m + j
 
-    for nut in nutrient_names:
-        j = nut_idx[nut]
-        actual = float(np.dot(content[:, j], x_vec))
+        lb_dn_val = safe_idx(ranging.row_bound_dn.value_, lb_row, -INF)
+        lb_up_val = safe_idx(ranging.row_bound_up.value_, lb_row, INF)
+        ub_dn_val = safe_idx(ranging.row_bound_dn.value_, ub_row, -INF)
+        ub_up_val = safe_idx(ranging.row_bound_up.value_, ub_row, INF)
 
-        check_lb = make_dual_check(model.c_nut_lb[nut], dual_nut_lb[nut])
-        check_ub = make_dual_check(model.c_nut_ub[nut], dual_nut_ub[nut])
+        row_dual_lb = safe_idx(row_dual, lb_row, 0.0)
+        row_dual_ub = safe_idx(row_dual, ub_row, 0.0)
 
-        n_inc_lb = binary_search_bound(model.lb_nut[nut], lb_nut_base[j], 0, MAX_BOUND, 'increase', check_lb)
-        n_dec_lb = binary_search_bound(model.lb_nut[nut], lb_nut_base[j], 0, MAX_BOUND, 'decrease', check_lb)
-        n_inc_ub = binary_search_bound(model.ub_nut[nut], ub_nut_base[j], 0, MAX_BOUND, 'increase', check_ub)
-        n_dec_ub = binary_search_bound(model.ub_nut[nut], ub_nut_base[j], 0, MAX_BOUND, 'decrease', check_ub)
+        if abs(lb_up_val) >= INF / 2:
+            n_inc_lb = "∞"
+        else:
+            n_inc_lb = _fmt_raw(max(0.0, lb_up_val - lb_nut[j]))
 
-        ub_disp = "∞" if ub_nut_base[j] >= 1e8 else float(ub_nut_base[j])
-        status = "达标" if (lb_nut_base[j] - 1e-4) <= actual <= (ub_nut_base[j] + 1e-4) else "不达标"
+        if lb_nut[j] <= 1e-9:
+            n_dec_lb = "0"
+        elif abs(lb_dn_val) >= INF / 2:
+            n_dec_lb = "∞"
+        else:
+            n_dec_lb = _fmt_raw(max(0.0, lb_nut[j] - lb_dn_val))
+
+        if ub_nut[j] >= 1e8:
+            n_inc_ub = "0"
+        elif abs(ub_up_val) >= INF / 2:
+            n_inc_ub = "∞"
+        else:
+            n_inc_ub = _fmt_raw(max(0.0, ub_up_val - ub_nut[j]))
+
+        if abs(ub_dn_val) >= INF / 2:
+            n_dec_ub = "∞"
+        else:
+            n_dec_ub = _fmt_raw(max(0.0, ub_nut[j] - ub_dn_val))
+
+        ub_disp = "∞" if ub_nut[j] >= 1e8 else float(ub_nut[j])
+        status_str = "达标" if (lb_nut[j] - 1e-4) <= actual <= (ub_nut[j] + 1e-4) else "不达标"
 
         result_nutrients.append({
             "营养素": nut,
             "结果": round(actual, 4),
-            "下限": float(lb_nut_base[j]),
+            "下限": float(lb_nut[j]),
             "上限": ub_disp,
-            "状态": status,
-            "下界影子价格": round(float(dual_nut_lb[nut]), 4),
-            "下界允许增加": _fmt_raw(n_inc_lb),
-            "下界允许减少": _fmt_raw(n_dec_lb),
-            "上界影子价格": round(float(dual_nut_ub[nut]), 4),
-            "上界允许增加": _fmt_raw(n_inc_ub),
-            "上界允许减少": _fmt_raw(n_dec_ub),
+            "状态": status_str,
+            "下界影子价格": round(float(row_dual_lb), 4),
+            "下界允许增加": n_inc_lb,
+            "下界允许减少": n_dec_lb,
+            "上界影子价格": round(float(row_dual_ub), 4),
+            "上界允许增加": n_inc_ub,
+            "上界允许减少": n_dec_ub,
         })
 
     return {
         "status": "success",
-        "total_cost": round(float(cost_base), 2),
+        "total_cost": round(cost_base, 2),
         "recipe": result_recipe,
         "nutrients": result_nutrients,
-        "solver": solver_name,
+        "solver": "highs (highspy matrix)",
     }
 
 
